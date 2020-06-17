@@ -30,7 +30,7 @@ func (s *Shim) RunInput(pollInterval time.Duration) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	s.listenForCollectMetricsSignals(ctx)
+	s.watchForShutdown(cancel)
 
 	acc := agent.NewAccumulator(s, s.metricCh)
 	acc.SetPrecision(time.Nanosecond)

@@ -89,12 +89,7 @@ func (s *Shim) Run(pollInterval time.Duration) error {
 }
 
 func hasQuit(ctx context.Context) bool {
-	select {
-	case <-ctx.Done():
-		return true
-	default:
-		return false
-	}
+	return ctx.Err() != nil
 }
 
 func (s *Shim) writeProcessedMetrics() error {
