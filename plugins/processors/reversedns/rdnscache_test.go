@@ -24,9 +24,13 @@ func TestSimpleReverseDNSLookup(t *testing.T) {
 	d.cleanup()
 	require.Len(t, d.expireList, 1) // ttl hasn't hit yet.
 
-	require.EqualValues(t, 0, d.CacheExpire)
-	require.EqualValues(t, 1, d.CacheMiss)
-	require.EqualValues(t, 1, d.CacheHit)
+	stats := d.Stats()
+
+	require.EqualValues(t, 0, stats.CacheExpire)
+	require.EqualValues(t, 1, stats.CacheMiss)
+	require.EqualValues(t, 1, stats.CacheHit)
+	require.EqualValues(t, 1, stats.RequestsFilled)
+	require.EqualValues(t, 0, stats.RequestsAbandoned)
 }
 
 func TestParallelReverseDNSLookup(t *testing.T) {
@@ -54,8 +58,10 @@ func TestParallelReverseDNSLookup(t *testing.T) {
 
 	require.Len(t, d.cache, 1)
 
-	require.EqualValues(t, 1, d.CacheMiss)
-	require.EqualValues(t, 1, d.CacheHit)
+	stats := d.Stats()
+
+	require.EqualValues(t, 1, stats.CacheMiss)
+	require.EqualValues(t, 1, stats.CacheHit)
 }
 
 func TestUnavailableDNSServerRespectsTimeout(t *testing.T) {
@@ -78,9 +84,11 @@ func TestCleanupHappens(t *testing.T) {
 	d.cleanup()
 	require.Len(t, d.expireList, 0)
 
-	require.EqualValues(t, 1, d.CacheExpire)
-	require.EqualValues(t, 1, d.CacheMiss)
-	require.EqualValues(t, 0, d.CacheHit)
+	stats := d.Stats()
+
+	require.EqualValues(t, 1, stats.CacheExpire)
+	require.EqualValues(t, 1, stats.CacheMiss)
+	require.EqualValues(t, 0, stats.CacheHit)
 }
 
 func TestCachePassthrough(t *testing.T) {
@@ -90,6 +98,18 @@ func TestCachePassthrough(t *testing.T) {
 
 	require.Len(t, d.cache, 0)
 
-	require.EqualValues(t, 1, d.CacheMiss)
-	require.EqualValues(t, 0, d.CacheHit)
+	stats := d.Stats()
+	require.EqualValues(t, 1, stats.CacheMiss)
+	require.EqualValues(t, 0, stats.CacheHit)
+}
+
+func TestLookupTimeout(t *testing.T) {
+	// 1ns timeout
+	d := NewReverseDNSCache(1*time.Second, 1, -1)
+	d.Lookup("8.8.8.8")
+
+	for d.Stats().RequestsAbandoned != 1 {
+		time.Sleep(1 * time.Millisecond)
+	}
+	require.EqualValues(t, 1, d.Stats().RequestsAbandoned)
 }

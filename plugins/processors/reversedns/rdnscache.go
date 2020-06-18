@@ -20,9 +20,7 @@ var defaultMaxWorkers = 10
 // if multiple goroutines request the same IP at the same time, one of the
 // requests will trigger the lookup and the rest will wait for its response.
 type ReverseDNSCache struct {
-	CacheHit    uint64
-	CacheMiss   uint64
-	CacheExpire uint64
+	stats RDNSCacheStats
 
 	// settings
 	ttl           time.Duration
@@ -30,8 +28,9 @@ type ReverseDNSCache struct {
 	maxWorkers    int
 
 	// internal
-	rwLock sync.RWMutex
-	sem    *semaphore.Weighted
+	rwLock              sync.RWMutex
+	sem                 *semaphore.Weighted
+	cancelCleanupWorker context.CancelFunc
 
 	cache map[string]*dnslookup
 
@@ -46,19 +45,29 @@ type ReverseDNSCache struct {
 	expireListLock sync.Mutex
 }
 
+type RDNSCacheStats struct {
+	CacheHit          uint64
+	CacheMiss         uint64
+	CacheExpire       uint64
+	RequestsAbandoned uint64
+	RequestsFilled    uint64
+}
+
 func NewReverseDNSCache(ttl, lookupTimeout time.Duration, workerPoolSize int) *ReverseDNSCache {
 	if workerPoolSize <= 0 {
 		workerPoolSize = defaultMaxWorkers
 	}
+	ctx, cancel := context.WithCancel(context.Background())
 	d := &ReverseDNSCache{
-		ttl:           ttl,
-		lookupTimeout: lookupTimeout,
-		cache:         map[string]*dnslookup{},
-		expireList:    []*dnslookup{},
-		maxWorkers:    workerPoolSize,
-		sem:           semaphore.NewWeighted(int64(workerPoolSize)),
+		ttl:                 ttl,
+		lookupTimeout:       lookupTimeout,
+		cache:               map[string]*dnslookup{},
+		expireList:          []*dnslookup{},
+		maxWorkers:          workerPoolSize,
+		sem:                 semaphore.NewWeighted(int64(workerPoolSize)),
+		cancelCleanupWorker: cancel,
 	}
-	d.startCleanupWorker()
+	d.startCleanupWorker(ctx)
 	return d
 }
 
@@ -93,7 +102,7 @@ func (d *ReverseDNSCache) lookup(ip string) []string {
 	if found && result.completed && result.expiresAt.After(time.Now()) {
 		debug("found in cache", result)
 		defer d.rwLock.RUnlock()
-		atomic.AddUint64(&d.CacheHit, 1)
+		atomic.AddUint64(&d.stats.CacheHit, 1)
 		// cache is valid
 		debug("Found in cache: ", result.domains)
 		return result.domains
@@ -129,7 +138,7 @@ func (d *ReverseDNSCache) subscribeTo(ip string) callbackChannelType {
 	result, found := d.unsafeGetFromCache(ip)
 	if found {
 		debug("found")
-		atomic.AddUint64(&d.CacheHit, 1)
+		atomic.AddUint64(&d.stats.CacheHit, 1)
 		// has the request been answered since we last checked?
 		if result.completed {
 			debug("found completed")
@@ -145,7 +154,7 @@ func (d *ReverseDNSCache) subscribeTo(ip string) callbackChannelType {
 		return callback
 	}
 
-	atomic.AddUint64(&d.CacheMiss, 1)
+	atomic.AddUint64(&d.stats.CacheMiss, 1)
 
 	debug("not found")
 
@@ -181,27 +190,34 @@ func (d *ReverseDNSCache) unsafeSaveToCache(lookup *dnslookup) {
 	d.cache[lookup.ip] = lookup
 }
 
-func (d *ReverseDNSCache) startCleanupWorker() {
+func (d *ReverseDNSCache) startCleanupWorker(ctx context.Context) {
 	go func() {
 		cleanupTick := time.NewTicker(10 * time.Second)
 		for {
 			select {
 			case <-cleanupTick.C:
 				d.cleanup()
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()
 }
 
 func (d *ReverseDNSCache) doLookup(l dnslookup) {
-	d.sem.Acquire(context.TODO(), 1)
-	defer d.sem.Release(1)
-
 	ctx, cancel := context.WithTimeout(context.Background(), d.lookupTimeout)
 	defer cancel()
+	if err := d.sem.Acquire(ctx, 1); err != nil {
+		// lookup timeout
+		d.abandonLookup(l)
+		return
+	}
+	defer d.sem.Release(1)
+
 	names, err := net.DefaultResolver.LookupAddr(ctx, l.ip)
 	if err != nil {
-		fmt.Printf("RDNS error: %s\n", err)
+		fmt.Fprintf(os.Stderr, "RDNS error: %s\n", err)
+		d.abandonLookup(l)
 		return
 	}
 
@@ -227,8 +243,29 @@ func (d *ReverseDNSCache) doLookup(l dnslookup) {
 	d.expireList = append(d.expireList, lookup)
 	d.expireListLock.Unlock()
 
+	atomic.AddUint64(&d.stats.RequestsFilled, uint64(len(callbacks)))
 	for _, cb := range callbacks {
 		cb <- names
+		close(cb)
+	}
+}
+
+func (d *ReverseDNSCache) abandonLookup(l dnslookup) {
+	d.rwLock.Lock()
+	lookup, found := d.unsafeGetFromCache(l.ip)
+	if !found {
+		d.rwLock.Unlock()
+		return
+	}
+
+	callbacks := lookup.callbacks
+	delete(d.cache, lookup.ip)
+	d.rwLock.Unlock()
+	// resolve the remaining callbacks to free the resources.
+	// Nobody is listening for the responses anymore anyway.
+	atomic.AddUint64(&d.stats.RequestsAbandoned, uint64(len(callbacks)))
+	for _, cb := range callbacks {
+		close(cb)
 	}
 }
 
@@ -239,12 +276,12 @@ func (d *ReverseDNSCache) cleanup() {
 		d.expireListLock.Unlock()
 		return
 	}
-	ipsToDelete := map[string]bool{}
+	ipsToDelete := []string{}
 	for i := 0; i < len(d.expireList); i++ {
 		if d.expireList[i].expiresAt.After(now) {
 			break // done. Nothing after this point is expired.
 		}
-		ipsToDelete[d.expireList[i].ip] = true
+		ipsToDelete = append(ipsToDelete, d.expireList[i].ip)
 	}
 	if len(ipsToDelete) == 0 { // maybe change to 1000
 		d.expireListLock.Unlock()
@@ -253,23 +290,33 @@ func (d *ReverseDNSCache) cleanup() {
 	d.expireList = d.expireList[len(ipsToDelete):]
 	d.expireListLock.Unlock()
 
-	atomic.AddUint64(&d.CacheExpire, uint64(len(ipsToDelete)))
+	atomic.AddUint64(&d.stats.CacheExpire, uint64(len(ipsToDelete)))
 
 	d.rwLock.Lock()
 	defer d.rwLock.Unlock()
-	newMap := map[string]*dnslookup{}
-	for k, v := range d.cache {
-		if !ipsToDelete[k] {
-			newMap[k] = v
-		}
+	for _, ip := range ipsToDelete {
+		delete(d.cache, ip)
 	}
-	d.cache = newMap
 }
 
 // waitForWorkers is a test function that eats up all the worker pool space to
 // make sure workers are done running.
 func (d *ReverseDNSCache) waitForWorkers() {
-	d.sem.Acquire(context.TODO(), int64(d.maxWorkers))
+	d.sem.Acquire(context.Background(), int64(d.maxWorkers))
+}
+
+func (d *ReverseDNSCache) Stats() RDNSCacheStats {
+	stats := RDNSCacheStats{}
+	stats.CacheHit = atomic.LoadUint64(&d.stats.CacheHit)
+	stats.CacheMiss = atomic.LoadUint64(&d.stats.CacheMiss)
+	stats.CacheExpire = atomic.LoadUint64(&d.stats.CacheExpire)
+	stats.RequestsAbandoned = atomic.LoadUint64(&d.stats.RequestsAbandoned)
+	stats.RequestsFilled = atomic.LoadUint64(&d.stats.RequestsFilled)
+	return stats
+}
+
+func (d *ReverseDNSCache) Stop() {
+	d.cancelCleanupWorker()
 }
 
 func debug(s ...interface{}) {

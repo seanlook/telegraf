@@ -1,28 +1,39 @@
 package parallel
 
 import (
-	"context"
 	"sync"
 
 	"github.com/influxdata/telegraf"
-	"golang.org/x/sync/semaphore"
 )
 
 type Unordered struct {
-	wg    sync.WaitGroup
-	acc   telegraf.Accumulator
-	queue chan telegraf.Metric
-	sem   *semaphore.Weighted
+	wg       sync.WaitGroup
+	acc      telegraf.Accumulator
+	fn       func(telegraf.Metric) []telegraf.Metric
+	inQueue  chan telegraf.Metric
+	outQueue chan telegraf.Metric
 }
 
-func NewUnordered(acc telegraf.Accumulator, workerCount int64) *Unordered {
-	queue := make(chan telegraf.Metric, 10)
+func NewUnordered(
+	acc telegraf.Accumulator,
+	fn func(telegraf.Metric) []telegraf.Metric,
+	workerCount int,
+) *Unordered {
 	p := &Unordered{
-		acc:   acc,
-		queue: queue,
-		sem:   semaphore.NewWeighted(workerCount),
+		acc:      acc,
+		inQueue:  make(chan telegraf.Metric, workerCount),
+		outQueue: make(chan telegraf.Metric, workerCount),
+		fn:       fn,
 	}
 
+	// start workers
+	p.wg.Add(1)
+	go func() {
+		p.startWorkers(workerCount)
+		p.wg.Done()
+	}()
+
+	// start one to read the output
 	p.wg.Add(1)
 	go func() {
 		p.readQueue()
@@ -31,16 +42,25 @@ func NewUnordered(acc telegraf.Accumulator, workerCount int64) *Unordered {
 	return p
 }
 
-func (p *Unordered) Do(fn func(acc telegraf.Accumulator)) {
-	p.sem.Acquire(context.TODO(), 1)
-	go func() {
-		fn(p.acc)
-		p.sem.Release(1)
-	}()
+func (p *Unordered) startWorkers(count int) {
+	wg := sync.WaitGroup{}
+	wg.Add(count)
+	for i := 0; i < count; i++ {
+		go func() {
+			for metric := range p.inQueue {
+				for _, m := range p.fn(metric) {
+					p.outQueue <- m
+				}
+			}
+			wg.Done()
+		}()
+	}
+	wg.Wait()
+	close(p.outQueue)
 }
 
 func (p *Unordered) readQueue() {
-	for m := range p.queue {
+	for m := range p.outQueue {
 		if m != nil {
 			p.acc.AddMetric(m)
 		}
@@ -48,11 +68,10 @@ func (p *Unordered) readQueue() {
 }
 
 func (p *Unordered) Stop() {
-	close(p.queue)
+	close(p.inQueue)
 	p.wg.Wait()
 }
 
-// match the accumulator interface so we can pose as it to track the metric count
-func (p *Unordered) PassMetric(m telegraf.Metric) {
-	p.queue <- m
+func (p *Unordered) Enqueue(m telegraf.Metric) {
+	p.inQueue <- m
 }

@@ -23,7 +23,19 @@ The `reverse_dns` processor does a reverse-dns lookup on fields with IPs in them
   # single rDNS request, and they will all wait for the answer for this long.
   lookup_timeout = "3s"
 
-  max_parallel_lookups = 100
+  # max_parallel_lookups is the maximum number of dns requests to be in flight 
+  # at the same time. Requesting hitting cached values do not count against this
+  # total, and neither do mulptiple requests for the same IP.
+  # It's probably best to keep this number fairly low.
+  max_parallel_lookups = 10
+
+  # ordered controls whether or not the metrics need to stay in the same order
+  # this plugin received them in. If false, this plugin will change the order 
+  # with requests hitting cached results moving through immediately and not
+  # waiting on slower lookups. This may cause issues for you if you are
+  # depending on the order of metrics staying the same. If so, set this to true.
+  # keeping the metrics ordered may be slightly slower.
+  ordered = false
 
   [[processors.reverse_dns.lookup]]
     # get the ip from the field "source_ip", and put the result in the field "source_name"

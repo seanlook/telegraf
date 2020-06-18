@@ -27,7 +27,19 @@ const sampleConfig = `
   # single rDNS request, and they will all wait for the answer for this long.
   lookup_timeout = "3s"
 
-  max_parallel_lookups = 100
+  # max_parallel_lookups is the maximum number of dns requests to be in flight
+  # at the same time. Requesting hitting cached values do not count against this
+  # total, and neither do mulptiple requests for the same IP.
+  # It's probably best to keep this number fairly low.
+  max_parallel_lookups = 10
+
+  # ordered controls whether or not the metrics need to stay in the same order
+  # this plugin received them in. If false, this plugin will change the order
+  # with requests hitting cached results moving through immediately and not
+  # waiting on slower lookups. This may cause issues for you if you are
+  # depending on the order of metrics staying the same. If so, set this to true.
+  # keeping the metrics ordered may be slightly slower.
+  ordered = false
 
   [[processors.reverse_dns.lookup]]
     # get the ip from the field "source_ip", and put the result in the field "source_name"
@@ -35,12 +47,12 @@ const sampleConfig = `
     dest = "source_name"
 
   [[processors.reverse_dns.lookup]]
-    # get the ip from the tag "destination_ip", and put the result in the tag 
+    # get the ip from the tag "destination_ip", and put the result in the tag
     # "destination_name".
     tag = "destination_ip"
     dest = "destination_name"
 
-    # If you would prefer destination_name to be a field you can use a subsequent 
+    # If you would prefer destination_name to be a field you can use a subsequent
     # converter like so:
     #   [[processors.converter.tags]]
     #     string = ["destination_name"]
@@ -63,6 +75,7 @@ type ReverseDNS struct {
 	CacheTTL           config.Duration `toml:"cache_ttl"`
 	LookupTimeout      config.Duration `toml:"lookup_timeout"`
 	MaxParallelLookups int             `toml:"max_parallel_lookups"`
+	Ordered            bool            `toml:"ordered"`
 }
 
 func (r *ReverseDNS) SampleConfig() string {
@@ -74,21 +87,26 @@ func (r *ReverseDNS) Description() string {
 }
 
 func (r *ReverseDNS) Init() {
+}
+
+func (r *ReverseDNS) Start(acc telegraf.Accumulator) error {
+	r.acc = acc
 	r.reverseDNSCache = NewReverseDNSCache(
 		time.Duration(r.CacheTTL),
 		time.Duration(r.LookupTimeout),
 		r.MaxParallelLookups, // max parallel reverse-dns lookups
 	)
-}
-
-func (r *ReverseDNS) Start(acc telegraf.Accumulator) error {
-	r.acc = acc
-	r.parallel = parallel.NewOrdered(acc, r.asyncAdd, 10000, r.MaxParallelLookups)
+	if r.Ordered {
+		r.parallel = parallel.NewOrdered(acc, r.asyncAdd, 10000, r.MaxParallelLookups+1)
+	} else {
+		r.parallel = parallel.NewUnordered(acc, r.asyncAdd, r.MaxParallelLookups+1)
+	}
 	return nil
 }
 
 func (r *ReverseDNS) Stop() error {
 	r.parallel.Stop()
+	r.reverseDNSCache.Stop()
 	return nil
 }
 
