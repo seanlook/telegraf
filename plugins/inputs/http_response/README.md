@@ -12,7 +12,9 @@ This input plugin checks HTTP/HTTPS connections.
   # address = "http://localhost"
 
   ## List of urls to query.
-  # urls = ["http://localhost"]
+  ## If the url starts witch 'exec ', it will run the command to get urls
+  ##   the command should return string with ,\s\n separated. like "http://aa http://bb"
+  # urls = ["http://localhost", "exec bash /etc/telegraf/telegraf.d/get_http_urls.sh"]
 
   ## Set http_proxy (telegraf uses the system wide proxy settings if it's is not set)
   # http_proxy = "http://localhost:8888"

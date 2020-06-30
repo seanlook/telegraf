@@ -1,6 +1,7 @@
 package http_response
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -8,11 +9,12 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os/exec"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/internal"
@@ -20,32 +22,18 @@ import (
 	"github.com/influxdata/telegraf/plugins/inputs"
 )
 
-const (
-	// defaultResponseBodyMaxSize is the default maximum response body size, in bytes.
-	// if the response body is over this size, we will raise a body_read_error.
-	defaultResponseBodyMaxSize = 32 * 1024 * 1024
-)
-
 // HTTPResponse struct
 type HTTPResponse struct {
-	Address         string   // deprecated in 1.12
-	URLs            []string `toml:"urls"`
-	HTTPProxy       string   `toml:"http_proxy"`
-	Body            string
-	Method          string
-	ResponseTimeout internal.Duration
-	HTTPHeaderTags  map[string]string `toml:"http_header_tags"`
-	Headers         map[string]string
-	FollowRedirects bool
-	// Absolute path to file with Bearer token
-	BearerToken         string        `toml:"bearer_token"`
-	ResponseBodyField   string        `toml:"response_body_field"`
-	ResponseBodyMaxSize internal.Size `toml:"response_body_max_size"`
+	Address             string   // deprecated in 1.12
+	URLs                []string `toml:"urls"`
+	HTTPProxy           string   `toml:"http_proxy"`
+	Body                string
+	Method              string
+	ResponseTimeout     internal.Duration
+	Headers             map[string]string
+	FollowRedirects     bool
 	ResponseStringMatch string
 	Interface           string
-	// HTTP Basic Auth Credentials
-	Username string `toml:"username"`
-	Password string `toml:"password"`
 	tls.ClientConfig
 
 	Log telegraf.Logger
@@ -65,7 +53,9 @@ var sampleConfig = `
   # address = "http://localhost"
 
   ## List of urls to query.
-  # urls = ["http://localhost"]
+  ## If the url starts witch 'exec ', it will run the command to get urls
+  ##   the command should return string with ,\s\n separated. like "http://aa http://bb"
+  # urls = ["http://localhost", "exec bash /etc/telegraf/telegraf.d/get_http_urls.sh"]
 
   ## Set http_proxy (telegraf uses the system wide proxy settings if it's is not set)
   # http_proxy = "http://localhost:8888"
@@ -79,27 +69,10 @@ var sampleConfig = `
   ## Whether to follow redirects from the server (defaults to false)
   # follow_redirects = false
 
-  ## Optional file with Bearer token
-  ## file content is added as an Authorization header
-  # bearer_token = "/path/to/file"
-
-  ## Optional HTTP Basic Auth Credentials
-  # username = "username"
-  # password = "pa$$word"
-
   ## Optional HTTP Request Body
   # body = '''
   # {'fake':'data'}
   # '''
-
-  ## Optional name of the field that will contain the body of the response. 
-  ## By default it is set to an empty String indicating that the body's content won't be added 
-  # response_body_field = ''
-
-  ## Maximum allowed HTTP response body size in bytes.
-  ## 0 means to use the default of 32MiB.
-  ## If the response body size exceeds this limit a "body_read_error" will be raised
-  # response_body_max_size = "32MiB"
 
   ## Optional substring or regex match in body of the response
   # response_string_match = "\"service_status\": \"up\""
@@ -117,14 +90,11 @@ var sampleConfig = `
   # [inputs.http_response.headers]
   #   Host = "github.com"
 
-  ## Optional setting to map response http headers into tags
-  ## If the http header is not present on the request, no corresponding tag will be added
-  ## If multiple instances of the http header are present, only the first value will be used
-  # http_header_tags = {"HTTP_HEADER" = "TAG_NAME"}
-
   ## Interface to use when dialing an address
   # interface = "eth0"
 `
+
+const MaxStderrBytes = 512
 
 // SampleConfig returns the plugin SampleConfig
 func (h *HTTPResponse) SampleConfig() string {
@@ -249,6 +219,81 @@ func setError(err error, fields map[string]interface{}, tags map[string]string) 
 	return nil
 }
 
+func (h *HTTPResponse) RunCommand(
+	command string,
+	timeout time.Duration,
+) ([]byte, []byte, error) {
+	split_cmd, err := shellquote.Split(command)
+	if err != nil || len(split_cmd) == 0 {
+		return nil, nil, fmt.Errorf("exec: unable to parse command, %s", err)
+	}
+
+	cmd := exec.Command(split_cmd[0], split_cmd[1:]...)
+
+	var (
+		out    bytes.Buffer
+		stderr bytes.Buffer
+	)
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+
+	runErr := internal.RunTimeout(cmd, timeout)
+
+	out = removeCarriageReturns(out)
+	if stderr.Len() > 0 {
+		stderr = removeCarriageReturns(stderr)
+		stderr = truncate(stderr)
+	}
+
+	return out.Bytes(), stderr.Bytes(), runErr
+}
+
+func truncate(buf bytes.Buffer) bytes.Buffer {
+	// Limit the number of bytes.
+	didTruncate := false
+	if buf.Len() > MaxStderrBytes {
+		buf.Truncate(MaxStderrBytes)
+		didTruncate = true
+	}
+	if i := bytes.IndexByte(buf.Bytes(), '\n'); i > 0 {
+		// Only show truncation if the newline wasn't the last character.
+		if i < buf.Len()-1 {
+			didTruncate = true
+		}
+		buf.Truncate(i)
+	}
+	if didTruncate {
+		buf.WriteString("...")
+	}
+	return buf
+}
+
+// removeCarriageReturns removes all carriage returns from the input if the
+// OS is Windows. It does not return any errors.
+func removeCarriageReturns(b bytes.Buffer) bytes.Buffer {
+	if runtime.GOOS == "windows" {
+		var buf bytes.Buffer
+		for {
+			byt, er := b.ReadBytes(0x0D)
+			end := len(byt)
+			if nil == er {
+				end -= 1
+			}
+			if nil != byt {
+				buf.Write(byt[:end])
+			} else {
+				break
+			}
+			if nil != er {
+				break
+			}
+		}
+		b = buf
+	}
+	return b
+
+}
+
 // HTTPGather gathers all fields and returns any errors it encounters
 func (h *HTTPResponse) httpGather(u string) (map[string]interface{}, map[string]string, error) {
 	// Prepare fields and tags
@@ -264,24 +309,11 @@ func (h *HTTPResponse) httpGather(u string) (map[string]interface{}, map[string]
 		return nil, nil, err
 	}
 
-	if h.BearerToken != "" {
-		token, err := ioutil.ReadFile(h.BearerToken)
-		if err != nil {
-			return nil, nil, err
-		}
-		bearer := "Bearer " + strings.Trim(string(token), "\n")
-		request.Header.Add("Authorization", bearer)
-	}
-
 	for key, val := range h.Headers {
 		request.Header.Add(key, val)
 		if key == "Host" {
 			request.Host = val
 		}
-	}
-
-	if h.Username != "" || h.Password != "" {
-		request.SetBasicAuth(h.Username, h.Password)
 	}
 
 	// Start Timer
@@ -298,7 +330,7 @@ func (h *HTTPResponse) httpGather(u string) (map[string]interface{}, map[string]
 		// Get error details
 		netErr := setError(err, fields, tags)
 
-		// If recognize the returned error, get out
+		// If recognize the returnded error, get out
 		if netErr != nil {
 			return fields, tags, nil
 		}
@@ -316,40 +348,21 @@ func (h *HTTPResponse) httpGather(u string) (map[string]interface{}, map[string]
 	// required by the net/http library
 	defer resp.Body.Close()
 
-	// Add the response headers
-	for headerName, tag := range h.HTTPHeaderTags {
-		headerValues, foundHeader := resp.Header[headerName]
-		if foundHeader && len(headerValues) > 0 {
-			tags[tag] = headerValues[0]
-		}
-	}
-
 	// Set log the HTTP response code
 	tags["status_code"] = strconv.Itoa(resp.StatusCode)
 	fields["http_response_code"] = resp.StatusCode
 
-	if h.ResponseBodyMaxSize.Size == 0 {
-		h.ResponseBodyMaxSize.Size = defaultResponseBodyMaxSize
-	}
-	bodyBytes, err := ioutil.ReadAll(io.LimitReader(resp.Body, h.ResponseBodyMaxSize.Size+1))
-	// Check first if the response body size exceeds the limit.
-	if err == nil && int64(len(bodyBytes)) > h.ResponseBodyMaxSize.Size {
-		h.setBodyReadError("The body of the HTTP Response is too large", bodyBytes, fields, tags)
-		return fields, tags, nil
-	} else if err != nil {
-		h.setBodyReadError(fmt.Sprintf("Failed to read body of HTTP Response : %s", err.Error()), bodyBytes, fields, tags)
+	bodyBytes, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		h.Log.Debugf("Failed to read body of HTTP Response : %s", err.Error())
+		setResult("body_read_error", fields, tags)
+		fields["content_length"] = len(bodyBytes)
+		if h.ResponseStringMatch != "" {
+			fields["response_string_match"] = 0
+		}
 		return fields, tags, nil
 	}
 
-	// Add the body of the response if expected
-	if len(h.ResponseBodyField) > 0 {
-		// Check that the content of response contains only valid utf-8 characters.
-		if !utf8.Valid(bodyBytes) {
-			h.setBodyReadError("The body of the HTTP Response is not a valid utf-8 string", bodyBytes, fields, tags)
-			return fields, tags, nil
-		}
-		fields[h.ResponseBodyField] = string(bodyBytes)
-	}
 	fields["content_length"] = len(bodyBytes)
 
 	// Check the response for a regex match.
@@ -366,16 +379,6 @@ func (h *HTTPResponse) httpGather(u string) (map[string]interface{}, map[string]
 	}
 
 	return fields, tags, nil
-}
-
-// Set result in case of a body read error
-func (h *HTTPResponse) setBodyReadError(error_msg string, bodyBytes []byte, fields map[string]interface{}, tags map[string]string) {
-	h.Log.Debugf(error_msg)
-	setResult("body_read_error", fields, tags)
-	fields["content_length"] = len(bodyBytes)
-	if h.ResponseStringMatch != "" {
-		fields["response_string_match"] = 0
-	}
 }
 
 // Gather gets all metric fields and tags and returns any errors it encounters
@@ -405,6 +408,25 @@ func (h *HTTPResponse) Gather(acc telegraf.Accumulator) error {
 			h.Log.Warn("'address' deprecated in telegraf 1.12, please use 'urls'")
 			h.URLs = []string{h.Address}
 		}
+	} else {
+		urls_dynamic := []string{}
+		for _, u := range h.URLs {
+			if strings.HasPrefix(u, "exec ") {
+				u = strings.TrimPrefix(u, "exec ")
+				out, errbuf, runErr := h.RunCommand(u, h.ResponseTimeout.Duration)
+				if runErr != nil {
+					err := fmt.Errorf("exec: %s for command '%s': %s", runErr, u, string(errbuf))
+					acc.AddError(err)
+					continue
+				}
+				out_fmt := strings.Trim(string(out), ", \t\n")
+				urls_tmp := regexp.MustCompile("[\\s\\,\\n]+").Split(out_fmt, -1)
+				urls_dynamic = append(urls_dynamic, urls_tmp...)
+			} else {
+				urls_dynamic = append(urls_dynamic, u)
+			}
+		}
+		h.URLs = urls_dynamic
 	}
 
 	if h.client == nil {
@@ -423,7 +445,7 @@ func (h *HTTPResponse) Gather(acc telegraf.Accumulator) error {
 		}
 
 		if addr.Scheme != "http" && addr.Scheme != "https" {
-			acc.AddError(errors.New("Only http and https are supported"))
+			acc.AddError(errors.New(fmt.Sprintf("Only http and https are supported: %s", addr.Scheme)))
 			continue
 		}
 
